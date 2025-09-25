@@ -4,6 +4,11 @@
 ## Requirement
 ```
 pip install pillow numpy
+
+pip install pillow scikit-image
+pip install pymupdf      # PDF
+pip install librosa      # Audio
+pip install opencv-python  # Video
 ```
 
 ## How to run
