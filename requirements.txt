@@ -1,0 +1,8 @@
+numpy
+pillow
+imagehash
+opencv-python
+scikit-image
+torch
+lpips
+open_clip_torch
