@@ -1,21 +1,22 @@
-
 # similarity_classifier_strict.py
 # -*- coding: utf-8 -*-
 """
-이미지 유사도 '모든 단계'를 반드시 수행하는 엄격 모드 구현 (LPIPS 입력 크기 맞춤 패치 포함).
+이미지 유사도 '모든 단계'를 반드시 수행하는 엄격 모드 구현
+- pHash 해밍거리
+- CLIP 임베딩 코사인 유사도
+- ORB 특징점 + RANSAC 정합(inlier 비율/개수)
+- LPIPS (크기/종횡비 보정 포함)
+- SSIM  (크기 정렬)
 
-필수 단계:
-  1) pHash 해밍거리
-  2) CLIP 임베딩 코사인 유사도
-  3) ORB 특징점 + RANSAC 정합(inlier 비율/개수)
-  4) LPIPS (작을수록 유사)  ← 크기/종횡비 차이 보정
-  5) SSIM  (클수록 유사)
-
-어느 한 단계라도 수행 불가하면 즉시 명시적 예외를 발생시킵니다.
+보강:
+- 한글/비ASCII 경로 안전 읽기(np.frombuffer+cv2.imdecode, BytesIO)
+- QuickGELU 경고 숨김(선택)
+- 코사인 임계 강화(0.70 / 0.45)
+- '강한 비유사' 가드룰: pHash↑ + LPIPS↑ + 기하 불량이면 D로 강등
 """
 
 from dataclasses import dataclass, asdict
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import numpy as np
 import json
 import os
@@ -23,7 +24,7 @@ import sys
 import io
 import warnings
 
-# 경고(QuickGELU mismatch 등) 숨기기 선택사항
+# 선택: open_clip QuickGELU 경고 숨김
 warnings.filterwarnings("ignore", message="QuickGELU mismatch")
 
 # ---- Hard imports (모두 필수) ----
@@ -44,18 +45,23 @@ class Thresholds:
     hamming_th_strong: int = 5
     hamming_th_maybe: int = 10  # 참고값
     # Embedding (cosine)
-    cos_th_high: float = 0.55
-    cos_th_mid_low: float = 0.40
+    cos_th_high: float = 0.70       # 강화: 0.55 -> 0.70
+    cos_th_mid_low: float = 0.45    # 강화: 0.40 -> 0.45
     # Geometric (ORB + RANSAC)
     inlier_ratio_th: float = 0.20
     inlier_count_th: int = 30
     # Perceptual
     lpips_th: float = 0.25
     ssim_th: float = 0.85
+    # Guard thresholds (hard dissimilar)
+    guard_phash_min: int = 20
+    guard_lpips_min: float = 0.60
+    guard_inlier_ratio_max: float = 0.05
+    guard_inlier_count_max: int = 15
 
 
 class StrictSimilarityClassifier:
-    def __init__(self, device: str | None = None, thresholds: Thresholds | None = None):
+    def __init__(self, device: Optional[str] = None, thresholds: Optional[Thresholds] = None):
         self.th = thresholds or Thresholds()
 
         # device 결정
@@ -73,7 +79,7 @@ class StrictSimilarityClassifier:
 
         # CLIP 모델
         self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
-            'ViT-B-32', pretrained='openai'
+            'ViT-B-32', pretrained='openai'  # 필요 시 'laion2b_s32b_b79k'로 교체 가능
         )
         self.clip_model = self.clip_model.eval().to(self.device)
 
@@ -98,7 +104,7 @@ class StrictSimilarityClassifier:
         data = self._read_bytes(path)
         return PILImage.open(io.BytesIO(data)).convert("RGB")
 
-    def _read_gray_cv(self, path: str):
+    def _read_gray_cv(self, path: str) -> np.ndarray:
         # cv2.imdecode 경유 → 유니코드 경로 안전
         data = np.frombuffer(self._read_bytes(path), dtype=np.uint8)
         img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
@@ -160,7 +166,7 @@ class StrictSimilarityClassifier:
             scale = short / min(w, h)
             return im.resize((int(round(w*scale)), int(round(h*scale))), PILImage.BICUBIC)
 
-        def center_crop_same(a: PILImage.Image, b: PILImage.Image) -> tuple[PILImage.Image, PILImage.Image]:
+        def center_crop_same(a: PILImage.Image, b: PILImage.Image) -> Tuple[PILImage.Image, PILImage.Image]:
             wa, ha = a.size
             wb, hb = b.size
             W = min(wa, wb)
@@ -230,7 +236,22 @@ class StrictSimilarityClassifier:
 
         th = self.th
 
-        # ---- 의사결정 규칙 ----
+        # ---- 강한 비유사 가드룰 ----
+        hard_dissimilar = (
+            (Hd >= th.guard_phash_min) and
+            (lpips_val >= th.guard_lpips_min) and
+            ((rin < th.guard_inlier_ratio_max) or (nin < th.guard_inlier_count_max))
+        )
+        if hard_dissimilar:
+            return {
+                "class": "D_dissimilar",
+                "confidence": 0.97,
+                "metrics": metrics,
+                "thresholds": asdict(th),
+                "notes": ["guard: high pHash + high LPIPS + poor geometry"]
+            }
+
+        # ---- 의사결정 규칙 (강화된 임계) ----
         if Hd <= th.hamming_th_strong:
             clazz, conf, note = "A_near_duplicate", 0.98, "pHash strong match"
         elif S >= th.cos_th_high:
@@ -261,7 +282,7 @@ class StrictSimilarityClassifier:
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="Strict Image Similarity Classifier (all checks required, LPIPS shape fix)")
+    p = argparse.ArgumentParser(description="Strict Image Similarity Classifier (all checks, LPIPS shape fix, guard rules)")
     p.add_argument("imgA")
     p.add_argument("imgB")
     p.add_argument("--device", choices=["cpu","cuda"], default=None,
