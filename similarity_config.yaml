@@ -1,49 +1,84 @@
-# similarity_config.yaml
-device: auto            # auto | cpu | cuda
+device: auto   # auto | cpu | cuda
 
 models:
   clip:
     arch: "ViT-B-32"
-    pretrained: "openai"   # 필요시 "laion2b_s32b_b79k"로 교체 가능
+    pretrained: "openai"
   lpips:
-    net: "alex"            # alex | vgg | squeeze
+    net: "alex"
 
 stages:
   hash:
     algo: "phash"
     hamming_th_strong: 5
     hamming_th_maybe: 10
+    # 추가: 엣지-해시 (도면 특화)
+    edge_hash:
+      enabled: true
+      canny_low_high: [100, 200]   # 엣지 민감도
+      hamming_th_strong: 6         # 라인아트 특성상 약간 완화
+      hamming_th_maybe: 12
 
   embedding:
     cosine_thresholds:
-      high: 0.70           # cos_th_high (강화)
-      mid_low: 0.45        # cos_th_mid_low (강화)
+      high: 0.75        # 도면/설계도 도메인은 임계 강화
+      mid_low: 0.50
+    # 선택: DINOv2 앙상블(추가 시)
+    dino:
+      enabled: false
+      weight: 0.4       # S_final = 0.6*clip + 0.4*dino
 
   geometry:
     feature: "ORB"
     orb_max_features: 5000
     matcher: "BF_HAMMING"
     ransac_reproj_thresh: 5.0
-    inlier_ratio_th: 0.20
-    inlier_count_th: 30
+    inlier_ratio_th: 0.18        # 촬영본 라인 매칭을 고려해 소폭 완화
+    inlier_count_th: 25
 
   perceptual:
-    ssim_th: 0.85
-    lpips_th: 0.25
-    # LPIPS 입력 정규화/크기 맞춤 정책(중앙 크롭)
+    ssim_th: 0.82               # 라인아트 특성 반영(조금 낮춤)
+    lpips_th: 0.30              # 라인아트 LPIPS는 높게 나올 수 있어 완화
     lpips_resize_short: 256
     lpips_center_crop_same: true
+    rectify_before_metrics: true   # 촬영본 원근 보정 후 SSIM/LPIPS
 
 guards:
-  # '강한 비유사' 가드룰: 아래 조건을 모두 만족하면 D_dissimilar로 강등
-  phash_min: 20               # Hd >= 20
-  lpips_min: 0.60             # LPIPS >= 0.60
-  inlier_ratio_max: 0.05      # rin < 0.05  (또는)
-  inlier_count_max: 15        # nin < 15
+  # '강한 비유사' 가드룰 (임베딩만 높을 때 오탐 방지)
+  phash_min: 20
+  lpips_min: 0.60
+  inlier_ratio_max: 0.05
+  inlier_count_max: 15
+
+drawing_filter:
+  enabled: true
+  edge_ratio_min: 0.08         # 엣지 픽셀 비율 하한(도면은 선 밀도 높음)
+  hough_min_lines: 50          # 직선 검출 최소 개수(타이틀블록/표 선분)
+  relax_if_true:               # 도면으로 판정되면 임계 완화폭
+    cosine_high_delta: -0.03
+    inlier_ratio_delta: -0.02
+    ssim_delta: -0.02
+  tighten_if_false:            # 도면이 아니면 임계 강화
+    cosine_high_delta: +0.05
+
+ocr:
+  enabled: true
+  lang: "kor+eng"
+  keywords:
+    - "CONFIDENTIAL"
+    - "도면번호"
+    - "DWG"
+    - "REV"
+    - "SHEET"
+  regex:
+    - "PRJ-[0-9]{6}"
+    - "DWG-[A-Z0-9-]{4,}"
+  # OCR 히트 시 임계 즉시 완화(= 차단 강화)
+  relax_on_hit:
+    cosine_high_delta: -0.05
+    inlier_ratio_delta: -0.03
 
 decision:
-  # 가능한 class 값: A_near_duplicate, B_same_scene, C_semantic_similar, D_dissimilar, uncertain
-  # 규칙 트리는 코드와 동일 (cosine → geom/perceptual 보조 → class/확신도)
   enable_uncertain: true
   uncertain_confidence: 0.55
   confidence_presets:
@@ -54,8 +89,10 @@ decision:
     C_semantic_weak: 0.75
     D_dissimilar: 0.95
     D_guard: 0.97
-
-io:
-  unicode_safe: true          # BytesIO/imdecode 사용
-  warnings:
-    suppress_quickgelu_mismatch: true
+  # 차단 정책
+  action:
+    A_near_duplicate: "block"
+    B_same_scene: "block"
+    C_semantic_similar: "block"     # 설계도 도메인은 의미 유사도도 차단
+    D_dissimilar: "allow"
+    uncertain: "review"
