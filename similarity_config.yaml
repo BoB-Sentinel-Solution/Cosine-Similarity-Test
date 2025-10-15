@@ -1,0 +1,61 @@
+# similarity_config.yaml
+device: auto            # auto | cpu | cuda
+
+models:
+  clip:
+    arch: "ViT-B-32"
+    pretrained: "openai"   # 필요시 "laion2b_s32b_b79k"로 교체 가능
+  lpips:
+    net: "alex"            # alex | vgg | squeeze
+
+stages:
+  hash:
+    algo: "phash"
+    hamming_th_strong: 5
+    hamming_th_maybe: 10
+
+  embedding:
+    cosine_thresholds:
+      high: 0.70           # cos_th_high (강화)
+      mid_low: 0.45        # cos_th_mid_low (강화)
+
+  geometry:
+    feature: "ORB"
+    orb_max_features: 5000
+    matcher: "BF_HAMMING"
+    ransac_reproj_thresh: 5.0
+    inlier_ratio_th: 0.20
+    inlier_count_th: 30
+
+  perceptual:
+    ssim_th: 0.85
+    lpips_th: 0.25
+    # LPIPS 입력 정규화/크기 맞춤 정책(중앙 크롭)
+    lpips_resize_short: 256
+    lpips_center_crop_same: true
+
+guards:
+  # '강한 비유사' 가드룰: 아래 조건을 모두 만족하면 D_dissimilar로 강등
+  phash_min: 20               # Hd >= 20
+  lpips_min: 0.60             # LPIPS >= 0.60
+  inlier_ratio_max: 0.05      # rin < 0.05  (또는)
+  inlier_count_max: 15        # nin < 15
+
+decision:
+  # 가능한 class 값: A_near_duplicate, B_same_scene, C_semantic_similar, D_dissimilar, uncertain
+  # 규칙 트리는 코드와 동일 (cosine → geom/perceptual 보조 → class/확신도)
+  enable_uncertain: true
+  uncertain_confidence: 0.55
+  confidence_presets:
+    A_near_duplicate: 0.98
+    B_same_scene_high: 0.95
+    B_same_scene_mid: 0.85
+    C_semantic_strong: 0.90
+    C_semantic_weak: 0.75
+    D_dissimilar: 0.95
+    D_guard: 0.97
+
+io:
+  unicode_safe: true          # BytesIO/imdecode 사용
+  warnings:
+    suppress_quickgelu_mismatch: true
